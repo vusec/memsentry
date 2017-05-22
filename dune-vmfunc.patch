@@ -1,0 +1,765 @@
+diff -ruw dune-master/kern/dune.h dune/kern/dune.h
+--- dune-master/kern/dune.h	2017-03-01 14:20:02.942618199 +0100
++++ dune/kern/dune.h	2017-03-03 17:15:53.685132938 +0100
+@@ -18,6 +18,9 @@
+ // XXX: Must match libdune/dune.h
+ #define DUNE_SIGNAL_INTR_BASE 200
+
++#define DUNE_VMCALL_SECRET_MAPPING_ADD 512
++
+ struct dune_config {
+     __u64 rip;
+     __u64 rsp;
+
+diff -ruw dune-master/kern/ept.c dune/kern/ept.c
+--- dune-master/kern/ept.c	2017-03-01 14:20:02.942618199 +0100
++++ dune/kern/ept.c	2017-03-03 17:15:53.685132938 +0100
+@@ -29,6 +29,8 @@
+ #define EPT_LEVELS  4   /* 0 through 3 */
+ #define HUGE_PAGE_SIZE  2097152
+
++#define EPTP_LIST_ENTRIES 512
++
+ static inline bool cpu_has_vmx_ept_execute_only(void)
+ {
+     return vmx_capability.ept & VMX_EPT_EXECUTE_ONLY_BIT;
+@@ -59,6 +61,25 @@
+     return vmx_capability.ept & VMX_EPT_PAGE_WALK_4_BIT;
+ }
+
++static inline bool cpu_has_vmx_ept_ad_bits(void)
++{
++    return vmx_capability.ept & VMX_EPT_AD_BIT;
++}
++
++static u64 construct_eptp(unsigned long root_hpa)
++{
++    u64 eptp;
++
++    /* TODO write the value reading from MSR */
++    eptp = VMX_EPT_DEFAULT_MT |
++        VMX_EPT_DEFAULT_GAW << VMX_EPT_GAW_EPTP_SHIFT;
++    if (cpu_has_vmx_ept_ad_bits())
++        eptp |= VMX_EPT_AD_ENABLE_BIT;
++    eptp |= (root_hpa & PAGE_MASK);
++
++    return eptp;
++}
++
+ #define VMX_EPT_FAULT_READ  0x01
+ #define VMX_EPT_FAULT_WRITE 0x02
+ #define VMX_EPT_FAULT_INS   0x04
+@@ -164,15 +185,29 @@
+         return ADDR_INVAL;
+ }
+
++inline unsigned eptp_to_ept_index(struct vmx_vcpu *vcpu, unsigned long eptp)
++{
++    unsigned i;
++    for (i = 0; i < vcpu->num_epts; i++)
++        if (vcpu->eptp_list[i] == eptp)
++            return i;
++
++    return (unsigned)-1;
++}
++
++inline unsigned vmx_get_current_ept_index(struct vmx_vcpu *vcpu)
++{
++    return eptp_to_ept_index(vcpu, vcpu->eptp);
++}
++
+ #define ADDR_TO_IDX(la, n) \
+     ((((unsigned long) (la)) >> (12 + 9 * (n))) & ((1 << 9) - 1))
+
+-static int
+-ept_lookup_gpa(struct vmx_vcpu *vcpu, void *gpa, int level,
+-       int create, epte_t **epte_out)
++static int ept_lookup_gpa(struct vmx_vcpu *vcpu, unsigned ept_index, void *gpa,
++        int level, int create, epte_t **epte_out)
+ {
++    epte_t *dir = (epte_t *) vcpu->ept_root_list[ept_index];
+     int i;
+-    epte_t *dir = (epte_t *) __va(vcpu->ept_root);
+
+     for (i = EPT_LEVELS - 1; i > level; i--) {
+         int idx = ADDR_TO_IDX(gpa, i);
+@@ -207,7 +242,7 @@
+ }
+
+ static int
+-ept_lookup(struct vmx_vcpu *vcpu, struct mm_struct *mm,
++ept_lookup(struct vmx_vcpu *vcpu, unsigned ept_index, struct mm_struct *mm,
+        void *hva, int level, int create, epte_t **epte_out)
+ {
+     void *gpa = (void *) hva_to_gpa(vcpu, mm, (unsigned long) hva);
+@@ -219,7 +254,7 @@
+         return -EINVAL;
+     }
+
+-    return ept_lookup_gpa(vcpu, gpa, level, create, epte_out);
++    return ept_lookup_gpa(vcpu, ept_index, gpa, level, create, epte_out);
+ }
+
+ static void free_ept_page(epte_t epte)
+@@ -235,9 +270,9 @@
+     put_page(page);
+ }
+
+-static void vmx_free_ept(unsigned long ept_root)
++static void vmx_free_ept(void *ept_root)
+ {
+-    epte_t *pgd = (epte_t *) __va(ept_root);
++    epte_t *pgd = (epte_t *) ept_root;
+     int i, j, k, l;
+
+     for (i = 0; i < PTRS_PER_PGD; i++) {
+@@ -348,8 +383,8 @@
+     return 1;
+ }
+
+-static int ept_set_pfnmap_epte(struct vmx_vcpu *vcpu, int make_write,
+-                unsigned long gpa, unsigned long hva)
++static int ept_set_pfnmap_epte(struct vmx_vcpu *vcpu, unsigned ept_index, int
++        make_write, unsigned long gpa, unsigned long hva)
+ {
+     struct vm_area_struct *vma;
+     struct mm_struct *mm = current->mm;
+@@ -378,7 +413,7 @@
+
+     /* NOTE: pfn's can not be huge pages, which is quite a relief here */
+     spin_lock(&vcpu->ept_lock);
+-    ret = ept_lookup_gpa(vcpu, (void *) gpa, 0, 1, &epte);
++    ret = ept_lookup_gpa(vcpu, ept_index, (void *) gpa, 0, 1, &epte);
+     if (ret) {
+         spin_unlock(&vcpu->ept_lock);
+         printk(KERN_ERR "ept: failed to lookup EPT entry\n");
+@@ -405,8 +440,8 @@
+     return 0;
+ }
+
+-static int ept_set_epte(struct vmx_vcpu *vcpu, int make_write,
+-            unsigned long gpa, unsigned long hva)
++static int ept_set_epte(struct vmx_vcpu *vcpu, unsigned ept_index,
++        int make_write, unsigned long gpa, unsigned long hva)
+ {
+     int ret;
+     epte_t *epte, flags;
+@@ -416,7 +451,7 @@
+
+     ret = get_user_pages_fast(hva, 1, make_write, &page);
+     if (ret != 1) {
+-        ret = ept_set_pfnmap_epte(vcpu, make_write, gpa, hva);
++        ret = ept_set_pfnmap_epte(vcpu, ept_index, make_write, gpa, hva);
+         if (ret)
+             printk(KERN_ERR "ept: failed to get user page %lx\n", hva);
+         return ret;
+@@ -431,7 +466,7 @@
+     else if (huge_shift == 21)
+         level = 1;
+
+-    ret = ept_lookup_gpa(vcpu, (void *) gpa,
++    ret = ept_lookup_gpa(vcpu, ept_index, (void *) gpa,
+                  level, 1, &epte);
+     if (ret) {
+         spin_unlock(&vcpu->ept_lock);
+@@ -479,7 +514,7 @@
+ int vmx_do_ept_fault(struct vmx_vcpu *vcpu, unsigned long gpa,
+              unsigned long gva, int fault_flags)
+ {
+-    int ret;
++    unsigned ept_index;
+     unsigned long hva = gpa_to_hva(vcpu, current->mm, gpa);
+     int make_write = (fault_flags & VMX_EPT_FAULT_WRITE) ? 1 : 0;
+
+@@ -490,10 +525,8 @@
+
+     pr_debug("ept: GPA: 0x%lx, GVA: 0x%lx, HVA: 0x%lx, flags: %x\n",
+          gpa, gva, hva, fault_flags);
+-
+-    ret = ept_set_epte(vcpu, make_write, gpa, hva);
+-
+-    return ret;
++    ept_index = vmx_get_current_ept_index(vcpu);
++    return ept_set_epte(vcpu, ept_index, make_write, gpa, hva);
+ }
+
+ /**
+@@ -504,7 +537,7 @@
+  *
+  * Returns 1 if the page was removed, 0 otherwise
+  */
+-static int ept_invalidate_page(struct vmx_vcpu *vcpu,
++static int ept_invalidate_page(struct vmx_vcpu *vcpu, unsigned ept_index,
+                    struct mm_struct *mm,
+                    unsigned long addr)
+ {
+@@ -518,7 +551,7 @@
+     }
+
+     spin_lock(&vcpu->ept_lock);
+-    ret = ept_lookup_gpa(vcpu, (void *) gpa, 0, 0, &epte);
++    ret = ept_lookup_gpa(vcpu, ept_index, (void *) gpa, 0, 0, &epte);
+     if (ret) {
+         spin_unlock(&vcpu->ept_lock);
+         return 0;
+@@ -541,7 +574,7 @@
+  *
+  * Returns 1 if the page is mapped, 0 otherwise
+  */
+-static int ept_check_page_mapped(struct vmx_vcpu *vcpu,
++static int ept_check_page_mapped(struct vmx_vcpu *vcpu, unsigned ept_index,
+                  struct mm_struct *mm,
+                  unsigned long addr)
+ {
+@@ -555,7 +588,7 @@
+     }
+
+     spin_lock(&vcpu->ept_lock);
+-    ret = ept_lookup_gpa(vcpu, (void *) gpa, 0, 0, &epte);
++    ret = ept_lookup_gpa(vcpu, ept_index, (void *) gpa, 0, 0, &epte);
+     spin_unlock(&vcpu->ept_lock);
+
+     return !ret;
+@@ -570,7 +603,7 @@
+  *
+  * Returns 1 if the page was accessed, 0 otherwise
+  */
+-static int ept_check_page_accessed(struct vmx_vcpu *vcpu,
++static int ept_check_page_accessed(struct vmx_vcpu *vcpu, unsigned ept_index,
+                    struct mm_struct *mm,
+                    unsigned long addr,
+                    bool flush)
+@@ -585,7 +618,7 @@
+     }
+
+     spin_lock(&vcpu->ept_lock);
+-    ret = ept_lookup_gpa(vcpu, (void *) gpa, 0, 0, &epte);
++    ret = ept_lookup_gpa(vcpu, ept_index, (void *) gpa, 0, 0, &epte);
+     if (ret) {
+         spin_unlock(&vcpu->ept_lock);
+         return 0;
+@@ -612,10 +645,12 @@
+                          unsigned long address)
+ {
+     struct vmx_vcpu *vcpu = mmu_notifier_to_vmx(mn);
++    unsigned ept_index;
+
+     pr_debug("ept: invalidate_page addr %lx\n", address);
+
+-    ept_invalidate_page(vcpu, mm, address);
++    for (ept_index = 0; ept_index < vcpu->num_epts; ept_index++)
++        ept_invalidate_page(vcpu, ept_index, mm, address);
+ }
+
+ static void ept_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+@@ -626,14 +661,18 @@
+     struct vmx_vcpu *vcpu = mmu_notifier_to_vmx(mn);
+     int ret;
+     epte_t *epte;
+-    unsigned long pos = start;
++    unsigned long pos;
+     bool sync_needed = false;
++    unsigned ept_index;
+
+     pr_debug("ept: invalidate_range_start start %lx end %lx\n", start, end);
+
++    for (ept_index = 0; ept_index < vcpu->num_epts; ept_index++)
++    {
++        pos = start;
+     spin_lock(&vcpu->ept_lock);
+     while (pos < end) {
+-        ret = ept_lookup(vcpu, mm, (void *) pos, 0, 0, &epte);
++            ret = ept_lookup(vcpu, ept_index, mm, (void *) pos, 0, 0, &epte);
+         if (!ret) {
+             pos += epte_big(*epte) ? HUGE_PAGE_SIZE : PAGE_SIZE;
+             ept_clear_epte(epte);
+@@ -643,6 +682,7 @@
+     }
+     spin_unlock(&vcpu->ept_lock);
+
++    }
+     if (sync_needed)
+         vmx_ept_sync_vcpu(vcpu);
+ }
+@@ -660,6 +700,7 @@
+                     pte_t pte)
+ {
+     struct vmx_vcpu *vcpu = mmu_notifier_to_vmx(mn);
++    unsigned ept_index;
+
+     pr_debug("ept: change_pte addr %lx flags %lx\n", address, pte_flags(pte));
+
+@@ -669,18 +710,22 @@
+      * get_user_pages_fast(). As a result, we just invalidate the
+      * page so that the mapping can be recreated later during a fault.
+      */
+-    ept_invalidate_page(vcpu, mm, address);
++    for (ept_index = 0; ept_index < vcpu->num_epts; ept_index++)
++        ept_invalidate_page(vcpu, ept_index, mm, address);
+ }
+
+ static int ept_mmu_notifier_clear_flush_young(struct mmu_notifier *mn,
+                           struct mm_struct *mm,
+-                          unsigned long address
++                          unsigned long address,
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,18,0)
+-                          , unsigned long end_addr
++                          unsigned long end_addr
+ #endif
++
+         )
+ {
+     struct vmx_vcpu *vcpu = mmu_notifier_to_vmx(mn);
++    unsigned ept_index;
++    int ret = 0;
+
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,18,0)
+     pr_debug("ept: clear_flush_young addr %lx end %lx\n", address, end_addr);
+@@ -688,10 +733,14 @@
+     pr_debug("ept: clear_flush_young addr %lx\n", address);
+ #endif
+
++    for (ept_index = 0; ept_index < vcpu->num_epts; ept_index++)
++    {
+     if (!vcpu->ept_ad_enabled)
+-        return ept_invalidate_page(vcpu, mm, address);
++            ret &= ept_invalidate_page(vcpu, ept_index, mm, address);
+     else
+-        return ept_check_page_accessed(vcpu, mm, address, true);
++            ret &= ept_check_page_accessed(vcpu, ept_index, mm, address, true);
++    }
++    return ret;
+ }
+
+ static int ept_mmu_notifier_test_young(struct mmu_notifier *mn,
+@@ -699,13 +748,19 @@
+                        unsigned long address)
+ {
+     struct vmx_vcpu *vcpu = mmu_notifier_to_vmx(mn);
++    unsigned ept_index;
++    int ret = 0;
+
+     pr_debug("ept: test_young addr %lx\n", address);
+
++    for (ept_index = 0; ept_index < vcpu->num_epts; ept_index++)
++    {
+     if (!vcpu->ept_ad_enabled)
+-        return ept_check_page_mapped(vcpu, mm, address);
++            ret &= ept_check_page_mapped(vcpu, ept_index, mm, address);
+     else
+-        return ept_check_page_accessed(vcpu, mm, address, false);
++            ret &= ept_check_page_accessed(vcpu, ept_index, mm, address, false);
++    }
++    return ret;
+ }
+
+ static void ept_mmu_notifier_release(struct mmu_notifier *mn,
+@@ -723,21 +778,21 @@
+     .release        = ept_mmu_notifier_release,
+ };
+
+-int vmx_init_ept(struct vmx_vcpu *vcpu)
++void *vmx_alloc_ept(void)
+ {
+     void *page = (void *) __get_free_page(GFP_KERNEL);
+
+     if (!page)
+-        return -ENOMEM;
++        return NULL;
+
+     memset(page, 0, PAGE_SIZE);
+-    vcpu->ept_root =  __pa(page);
+
+-    return 0;
++    return page;
+ }
+
+ int vmx_create_ept(struct vmx_vcpu *vcpu)
+ {
++    unsigned ept_index;
+     int ret;
+
+     vcpu->mmu_notifier.ops = &ept_mmu_notifier_ops;
+@@ -748,13 +803,61 @@
+     return 0;
+
+ fail:
+-    vmx_free_ept(vcpu->ept_root);
++    for (ept_index = 0; ept_index < vcpu->num_epts; ept_index++)
++        vmx_free_ept(vcpu->ept_root_list[ept_index]);
+
+     return ret;
+ }
+
+ void vmx_destroy_ept(struct vmx_vcpu *vcpu)
+ {
++    unsigned ept_index;
+     mmu_notifier_unregister(&vcpu->mmu_notifier, current->mm);
+-    vmx_free_ept(vcpu->ept_root);
++    for (ept_index = 0; ept_index < vcpu->num_epts; ept_index++)
++        vmx_free_ept(vcpu->ept_root_list[ept_index]);
++}
++
++int vmx_init_eptp_list(struct vmx_vcpu *vcpu)
++{
++    unsigned long *eptp_list;
++    void **ept_root_list;
++    int i;
++
++    eptp_list = kmalloc(sizeof(unsigned long) * EPTP_LIST_ENTRIES, GFP_KERNEL);
++    if (!eptp_list)
++        return -ENOMEM;
++
++    ept_root_list = kmalloc(sizeof(void *) * EPTP_LIST_ENTRIES, GFP_KERNEL);
++    if (!ept_root_list)
++    {
++        kfree(eptp_list);
++        return -ENOMEM;
++    }
++
++    vcpu->eptp_list = eptp_list;
++    vcpu->ept_root_list = ept_root_list;
++    memset(vcpu->eptp_list, 0, sizeof(unsigned long) * EPTP_LIST_ENTRIES);
++    memset(vcpu->ept_root_list, 0, sizeof(void *) * EPTP_LIST_ENTRIES);
++
++    vcpu->num_epts = 3;
++    for (i = 0; i < vcpu->num_epts; i++)
++    {
++        vcpu->ept_root_list[i] = vmx_alloc_ept();
++        if (!vcpu->ept_root_list[i])
++        {
++            kfree(eptp_list);
++            kfree(ept_root_list);
++            /* TODO free succesfull ept allocs so far. */
++            return -ENOMEM;
++        }
++        vcpu->eptp_list[i] = construct_eptp(__pa(vcpu->ept_root_list[i]));
++    }
++
++    return 0;
++}
++
++void vmx_free_eptp_list(struct vmx_vcpu *vcpu)
++{
++    kfree(vcpu->eptp_list);
++    kfree(vcpu->ept_root_list);
+ }
+diff -ruw dune-master/kern/vmx.c dune/kern/vmx.c
+--- dune-master/kern/vmx.c	2017-03-01 14:20:02.942618199 +0100
++++ dune/kern/vmx.c	2017-05-22 12:17:54.104970910 +0200
+@@ -126,6 +126,12 @@
+         SECONDARY_EXEC_ENABLE_EPT;
+ }
+
++static inline bool cpu_has_vmx_vmfunc(void)
++{
++    return vmcs_config.cpu_based_2nd_exec_ctrl &
++        SECONDARY_EXEC_ENABLE_VMFUNC;
++}
++
+ static inline bool cpu_has_vmx_invept_individual_addr(void)
+ {
+     return vmx_capability.ept & VMX_EPT_EXTENT_INDIVIDUAL_BIT;
+@@ -382,7 +388,8 @@
+             SECONDARY_EXEC_ENABLE_VPID |
+             SECONDARY_EXEC_ENABLE_EPT |
+             SECONDARY_EXEC_RDTSCP |
+-            SECONDARY_EXEC_ENABLE_INVPCID;
++            SECONDARY_EXEC_ENABLE_INVPCID |
++            SECONDARY_EXEC_ENABLE_VMFUNC;
+         if (adjust_vmx_controls(min2, opt2,
+                     MSR_IA32_VMX_PROCBASED_CTLS2,
+                     &_cpu_based_2nd_exec_control) < 0)
+@@ -629,6 +636,7 @@
+ static void vmx_get_cpu(struct vmx_vcpu *vcpu)
+ {
+     int cur_cpu = get_cpu();
++    unsigned ept_index;
+
+     if (__get_cpu_var(local_vcpu) != vcpu) {
+         __get_cpu_var(local_vcpu) = vcpu;
+@@ -641,7 +649,8 @@
+                 vmcs_clear(vcpu->vmcs);
+
+             vpid_sync_context(vcpu->vpid);
+-            ept_sync_context(vcpu->eptp);
++            for (ept_index = 0; ept_index < vcpu->num_epts; ept_index++)
++                ept_sync_context(vcpu->eptp_list[ept_index]);
+
+             vcpu->launched = 0;
+             vmcs_load(vcpu->vmcs);
+@@ -665,8 +674,10 @@
+ static void __vmx_sync_helper(void *ptr)
+ {
+     struct vmx_vcpu *vcpu = ptr;
++    unsigned ept_index;
+
+-    ept_sync_context(vcpu->eptp);
++    for (ept_index = 0; ept_index < vcpu->num_epts; ept_index++)
++        ept_sync_context(vcpu->eptp_list[ept_index]);
+ }
+
+ struct sync_addr_args {
+@@ -677,8 +688,10 @@
+ static void __vmx_sync_individual_addr_helper(void *ptr)
+ {
+     struct sync_addr_args *args = ptr;
++    unsigned ept_index;
+
+-    ept_sync_individual_addr(args->vcpu->eptp,
++    for (ept_index = 0; ept_index < args->vcpu->num_epts; ept_index++)
++        ept_sync_individual_addr(args->vcpu->eptp_list[ept_index],
+                  (args->gpa & ~(PAGE_SIZE - 1)));
+ }
+
+@@ -759,20 +772,6 @@
+     printk(KERN_INFO "vmx: --- End VCPU Dump ---\n");
+ }
+
+-static u64 construct_eptp(unsigned long root_hpa)
+-{
+-    u64 eptp;
+-
+-    /* TODO write the value reading from MSR */
+-    eptp = VMX_EPT_DEFAULT_MT |
+-        VMX_EPT_DEFAULT_GAW << VMX_EPT_GAW_EPTP_SHIFT;
+-    if (cpu_has_vmx_ept_ad_bits())
+-        eptp |= VMX_EPT_AD_ENABLE_BIT;
+-    eptp |= (root_hpa & PAGE_MASK);
+-
+-    return eptp;
+-}
+-
+ /**
+  * vmx_setup_initial_guest_state - configures the initial state of guest registers
+  */
+@@ -941,6 +940,9 @@
+     }
+
+     vmcs_write64(EPT_POINTER, vcpu->eptp);
++    vmcs_write64(EPTP_LIST_ADDR, __pa(vcpu->eptp_list));
++
++    vmcs_write64(VM_FUNCTION_CONTROLS, 0x1); /* bit 1 -> ept switching */
+
+     vmcs_write32(PAGE_FAULT_ERROR_CODE_MASK, 0);
+     vmcs_write32(PAGE_FAULT_ERROR_CODE_MATCH, 0);
+@@ -1046,9 +1048,12 @@
+     vcpu->syscall_tbl = (void *) &dune_syscall_tbl;
+
+     spin_lock_init(&vcpu->ept_lock);
+-    if (vmx_init_ept(vcpu))
+-        goto fail_ept;
+-    vcpu->eptp = construct_eptp(vcpu->ept_root);
++
++    if (vmx_init_eptp_list(vcpu))
++        goto fail_eptp_list;
++
++    /* For the initial EPT_POINTER we use the first EPT for now. */
++    vcpu->eptp = vcpu->eptp_list[0];
+
+     vmx_get_cpu(vcpu);
+     vmx_setup_vmcs(vcpu);
+@@ -1060,11 +1065,12 @@
+         printk(KERN_INFO "vmx: enabled EPT A/D bits");
+     }
+     if (vmx_create_ept(vcpu))
+-        goto fail_ept;
++        goto fail_eptp_list;
+
+     return vcpu;
+
+-fail_ept:
++
++fail_eptp_list:
+     vmx_free_vpid(vcpu);
+ fail_vpid:
+     vmx_free_vmcs(vcpu->vmcs);
+@@ -1079,9 +1085,15 @@
+  */
+ static void vmx_destroy_vcpu(struct vmx_vcpu *vcpu)
+ {
+-    vmx_destroy_ept(vcpu);
++    unsigned ept_index;
++
+     vmx_get_cpu(vcpu);
+-    ept_sync_context(vcpu->eptp);
++
++    vmx_destroy_ept(vcpu);
++    for (ept_index = 0; ept_index < vcpu->num_epts; ept_index++)
++        ept_sync_context(vcpu->eptp_list[ept_index]);
++    vmx_free_eptp_list(vcpu);
++
+     vmcs_clear(vcpu->vmcs);
+     __get_cpu_var(local_vcpu) = NULL;
+     vmx_put_cpu(vcpu);
+@@ -1369,6 +1381,49 @@
+                    vmcs_read32(VM_EXIT_INSTRUCTION_LEN));
+ }
+
++/* Adds a page to the secret mappings for the current EPT. Does *not*
++ * retroactively remove it from other EPTs!
++ */
++int vmx_secret_mapping_add(struct vmx_vcpu *vcpu, unsigned long gva,
++        unsigned long len)
++{
++    unsigned i;
++
++    /* gva and len must be page aligned */
++    if (gva & 0xfff)
++        return -EINVAL;
++    if (len & 0xfff)
++        return -EINVAL;
++
++    for (i = 0; i < MAX_SECRET_MAPPINGS; i++)
++        if (vcpu->secret_mappings[i].gva == 0)
++            break;
++    if (i == MAX_SECRET_MAPPINGS)
++        return -ENOMEM;
++
++    printk("vmx: Adding secret mapping GVA: 0x%lx  len: 0x%lx  ept: %d\n", gva,
++            len, vmx_get_current_ept_index(vcpu));
++    vcpu->secret_mappings[i].gva = gva;
++    vcpu->secret_mappings[i].len = len;
++    vcpu->secret_mappings[i].ept_index = vmx_get_current_ept_index(vcpu);
++    return 0;
++}
++
++int vmx_allow_ept_mapping(struct vmx_vcpu *vcpu, unsigned long gpa,
++        unsigned long gva, int fault_flags)
++{
++    unsigned i;
++    for (i = 0; i < MAX_SECRET_MAPPINGS; i++)
++    {
++        struct secret_mapping *m = &vcpu->secret_mappings[i];
++        if (m->gva <= gva && gva < m->gva + m->len &&
++                m->ept_index != vmx_get_current_ept_index(vcpu))
++            return 0;
++    }
++
++    return 1;
++}
++
+ static int vmx_handle_ept_violation(struct vmx_vcpu *vcpu)
+ {
+     unsigned long gva, gpa;
+@@ -1380,6 +1435,8 @@
+     gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS);
+     vmx_put_cpu(vcpu);
+
++    //printk(KERN_ERR "EPT: ept violation %d %p %p %u\n", exit_qual, (void *)gva, (void *)gpa, vcpu->eptp);
++
+     if (exit_qual & (1 << 6)) {
+         printk(KERN_ERR "EPT: GPA 0x%lx exceeds GAW!\n", gpa);
+         return -EINVAL;
+@@ -1390,6 +1447,12 @@
+         return -EINVAL;
+     }
+
++    if (!vmx_allow_ept_mapping(vcpu, gpa, gva, exit_qual)) {
++        printk(KERN_ERR "EPT: policy disallowed mapping, GVA: 0x%lx GPA: 0x%lx ept: %d\n",
++                gva, gpa, vmx_get_current_ept_index(vcpu));
++        return -EINVAL;
++    }
++
+     ret = vmx_do_ept_fault(vcpu, gpa, gva, exit_qual);
+
+     if (ret) {
+@@ -1418,6 +1481,12 @@
+     }
+ #endif
+
++    if (unlikely(vcpu->regs[VCPU_REGS_RAX] == DUNE_VMCALL_SECRET_MAPPING_ADD)) {
++        vcpu->regs[VCPU_REGS_RAX] = vmx_secret_mapping_add(vcpu,
++                vcpu->regs[VCPU_REGS_RDI], vcpu->regs[VCPU_REGS_RSI]);
++        return;
++    }
++
+     if (unlikely(vcpu->regs[VCPU_REGS_RAX] > NUM_SYSCALLS)) {
+         vcpu->regs[VCPU_REGS_RAX] = -EINVAL;
+         return;
+@@ -1591,6 +1656,8 @@
+             vmx_step_instruction();
+         }
+
++        vcpu->eptp = vmcs_read64(EPT_POINTER);
++
+         vmx_put_cpu(vcpu);
+
+         if (ret == EXIT_REASON_VMCALL)
+@@ -1734,6 +1801,11 @@
+         return -EIO;
+     }
+
++    if (!cpu_has_vmx_vmfunc()) {
++        printk(KERN_ERR "vmx: CPU is missing required feature 'VMFUNC'\n");
++        return -EIO;
++    }
++
+     if (!vmx_capability.has_load_efer) {
+         printk(KERN_ERR "vmx: ability to load EFER register is required\n");
+         return -EIO;
+diff -ruw dune-master/kern/vmx.h dune/kern/vmx.h
+--- dune-master/kern/vmx.h	2017-03-01 14:20:02.942618199 +0100
++++ dune/kern/vmx.h	2017-03-03 17:15:53.685132938 +0100
+@@ -25,6 +25,8 @@
+
+ #define NR_AUTOLOAD_MSRS 8
+
++#define MAX_SECRET_MAPPINGS 16
++
+ enum vmx_reg {
+     VCPU_REGS_RAX = 0,
+     VCPU_REGS_RCX = 1,
+@@ -48,6 +50,12 @@
+     NR_VCPU_REGS
+ };
+
++struct secret_mapping {
++    unsigned long gva; /* beginning of page */
++    unsigned long len; /* bytes of this mapping (multiple of page size) */
++    unsigned long ept_index;
++};
++
+ struct vmx_vcpu {
+     int cpu;
+     int vpid;
+@@ -55,8 +63,6 @@
+
+     struct mmu_notifier mmu_notifier;
+     spinlock_t ept_lock;
+-    unsigned long ept_root;
+-    unsigned long eptp;
+     bool ept_ad_enabled;
+
+     u8  fail;
+@@ -76,6 +82,14 @@
+
+     struct vmcs *vmcs;
+     void *syscall_tbl;
++
++    unsigned num_epts;        /* num active, the lists are always 512 entries */
++    unsigned long *eptp_list; /* list of EPT_POINTER-like values */
++    void **ept_root_list;     /* list of va pointers to ept roots */
++    unsigned long eptp;       /* current EPT_POINTER, read after every exit */
++    struct secret_mapping secret_mappings[MAX_SECRET_MAPPINGS]; /* (fixed size!)
++                                list of pages that are secret (only accessible
++                                in 1 EPT). */
+ };
+
+ extern __init int vmx_init(void);
+@@ -83,9 +97,13 @@
+
+ extern int vmx_launch(struct dune_config *conf, int64_t *ret_code);
+
+-extern int vmx_init_ept(struct vmx_vcpu *vcpu);
++extern void *vmx_alloc_ept(void);
+ extern int vmx_create_ept(struct vmx_vcpu *vcpu);
+ extern void vmx_destroy_ept(struct vmx_vcpu *vcpu);
++extern int vmx_init_eptp_list(struct vmx_vcpu *vcpu);
++extern void vmx_free_eptp_list(struct vmx_vcpu *vcpu);
++
++extern unsigned vmx_get_current_ept_index(struct vmx_vcpu *vcpu);
+
+ extern int
+ vmx_do_ept_fault(struct vmx_vcpu *vcpu, unsigned long gpa,
+
