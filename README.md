@@ -96,3 +96,23 @@ opt ...
     -memsentry-prot-method=.. -memsenty-max-region-size=..  # MemSentry options
     -memsentry-benchdomain -memsentry -memsentry-benchdomain-post ...
 ```
+
+## Example: SafeStack
+
+SafeStack is a production-ready defense, part of Clang/LLVM. It splits up the
+stack into a safe stack (the normal stack) and the unsafe stack. All allocations
+for which it cannot statically prove they are only used in a safe way are moved
+to the unsafe stack.  SafeStack consist of a compiler pass (`SafeStack.cpp`) and
+a runtime (`compiler-rt/lib/safestack`).
+
+To protect SafeStack with MemSentry, we need to pick an address-based or
+domain-based protection method, separate the safe stack from the rest of the
+address space and mark all instructions that use the safe stack.
+Since the safestack is accessed very frequently, and accessed implicitly by
+instructions such as calls and returns, an address-based method makes most
+sense. To ensure the correct layout for this, the run-time can be modified to
+reserve the required portion of the address-space with a (non-reserved) memory
+mapping in its `__safestack_init` function (part of the program's
+`.preinit_array`). Finally, to mark which instructions can access this safe
+region, we can go over all the uses of safe allocations in the LLVM pass, and
+mark them safe for MemSentry.
