@@ -286,7 +286,8 @@ class AddressProtection : public Protection {
             for (unsigned i = 0, n = CS.getNumArgOperands(); i < n; i++) {
                 Value *Arg = CS.getArgOperand(i);
                 if (Arg->getType()->isPointerTy()){
-                    verifyPtr(Arg, I);
+                    Value *MaskedArg = verifyPtr(Arg, I);
+                    CS.getInstruction()->setOperand(i, MaskedArg);
                 }
             }
         }
